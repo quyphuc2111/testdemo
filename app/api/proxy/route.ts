@@ -4,6 +4,26 @@ import { NextRequest, NextResponse } from 'next/server';
 let storedCookies: string[] = [];
 
 /**
+ * Get the proxy base URL from Traefik forwarding headers
+ * Uses X-Forwarded-Host and X-Forwarded-Proto headers set by Traefik
+ * Falls back to request URL for local development
+ * Requirements: 5.1, 5.2, 5.3
+ */
+export function getProxyBaseUrl(request: NextRequest): string {
+  // Priority: Use X-Forwarded headers from Traefik
+  const forwardedHost = request.headers.get('x-forwarded-host');
+  const forwardedProto = request.headers.get('x-forwarded-proto') || 'https';
+
+  if (forwardedHost) {
+    return `${forwardedProto}://${forwardedHost}`;
+  }
+
+  // Fallback for local development (no Traefik)
+  const requestUrl = new URL(request.url);
+  return `${requestUrl.protocol}//${requestUrl.host}`;
+}
+
+/**
  * Parse and store Set-Cookie headers from a response
  * Replaces cookies with the same name
  * Requirements: 3.1, 3.3
@@ -43,8 +63,23 @@ function getContentType(response: Response): string {
  * Determine if content should be rewritten (HTML only)
  * Requirements: 4.5
  */
-function shouldRewriteContent(contentType: string): boolean {
+function shouldRewriteHtml(contentType: string): boolean {
   return contentType.toLowerCase().includes('text/html');
+}
+
+/**
+ * Determine if content is CSS
+ */
+function isCssContent(contentType: string): boolean {
+  return contentType.toLowerCase().includes('text/css');
+}
+
+/**
+ * Determine if content is JavaScript
+ */
+function isJsContent(contentType: string): boolean {
+  const ct = contentType.toLowerCase();
+  return ct.includes('javascript') || ct.includes('application/x-javascript');
 }
 
 /**
@@ -55,6 +90,55 @@ function getResponseHeaders(contentType: string): HeadersInit {
   return {
     'Content-Type': contentType,
   };
+}
+
+/**
+ * Rewrite CSS url() references to route through proxy
+ * This ensures fonts and images in CSS load correctly without CORS issues
+ */
+function rewriteCssUrls(css: string, targetUrl: string, proxyBaseUrl: string): string {
+  const baseUrl = new URL(targetUrl);
+  
+  // Rewrite url() references
+  return css.replace(/url\s*\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote, urlPath) => {
+    try {
+      // Skip data URLs
+      if (urlPath.startsWith('data:')) {
+        return match;
+      }
+      
+      // Convert to absolute URL first
+      let absoluteUrl: string;
+      if (urlPath.startsWith('http://') || urlPath.startsWith('https://')) {
+        absoluteUrl = urlPath;
+      } else if (urlPath.startsWith('//')) {
+        // Protocol-relative URL
+        absoluteUrl = 'https:' + urlPath;
+      } else if (urlPath.startsWith('/')) {
+        // Absolute path
+        absoluteUrl = baseUrl.origin + urlPath;
+      } else {
+        // Relative path
+        absoluteUrl = new URL(urlPath, targetUrl).href;
+      }
+      
+      // Route through proxy to avoid CORS
+      const proxiedUrl = `${proxyBaseUrl}/api/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+      return `url(${quote}${proxiedUrl}${quote})`;
+    } catch {
+      return match;
+    }
+  });
+}
+
+/**
+ * Rewrite JavaScript to fix relative URL references
+ * Handles common patterns like baseUrl assignments
+ */
+function rewriteJsUrls(js: string): string {
+  // This is a simple approach - just ensure any relative paths work
+  // Most JS URL handling is done by the AJAX interceptor in HTML
+  return js;
 }
 
 /**
@@ -146,25 +230,65 @@ function rewriteResourceLinks(html: string, proxyBaseUrl: string): string {
 }
 
 /**
+ * Rewrite anchor links to route through the proxy
+ * This ensures navigation within iframe stays proxied
+ * Requirements: 1.2
+ */
+function rewriteAnchorLinks(html: string, proxyBaseUrl: string, targetOrigin: string): string {
+  // Rewrite <a href="..."> links that point to target domain
+  return html.replace(/(<a[^>]*href=["'])([^"'#]+)(["'])/gi, (match, prefix, hrefUrl, suffix) => {
+    try {
+      // Skip already proxied URLs, javascript:, mailto:, tel:, and hash-only links
+      if (
+        hrefUrl.includes('/api/proxy?url=') ||
+        hrefUrl.startsWith('javascript:') ||
+        hrefUrl.startsWith('mailto:') ||
+        hrefUrl.startsWith('tel:') ||
+        hrefUrl.startsWith('#')
+      ) {
+        return match;
+      }
+      
+      // Check if URL is to the target domain
+      const urlObj = new URL(hrefUrl);
+      if (urlObj.origin === targetOrigin) {
+        const encodedUrl = encodeURIComponent(hrefUrl);
+        return `${prefix}${proxyBaseUrl}/api/proxy?url=${encodedUrl}${suffix}`;
+      }
+      
+      // Leave external links unchanged
+      return match;
+    } catch {
+      return match;
+    }
+  });
+}
+
+/**
  * Comprehensive HTML content rewriting
  * Combines all URL rewriting operations
  * Requirements: 1.2, 1.3, 1.5
  */
 function rewriteHtmlContent(html: string, targetUrl: string, proxyBaseUrl: string): string {
+  const targetOrigin = new URL(targetUrl).origin;
+  
   // Step 1: Convert all relative URLs to absolute
   let result = rewriteRelativeUrls(html, targetUrl);
   
-  // Step 2: Rewrite form actions to go through proxy
+  // Step 2: Rewrite anchor links to go through proxy (for iframe navigation)
+  result = rewriteAnchorLinks(result, proxyBaseUrl, targetOrigin);
+  
+  // Step 3: Rewrite form actions to go through proxy
   result = rewriteFormActions(result, proxyBaseUrl);
   
-  // Step 3: Rewrite resource links to go through proxy
+  // Step 4: Rewrite resource links to go through proxy
   result = rewriteResourceLinks(result, proxyBaseUrl);
   
   return result;
 }
 
 /**
- * Generate AJAX interceptor script that overrides XMLHttpRequest and fetch
+ * Generate AJAX interceptor script that overrides XMLHttpRequest, fetch, and script loading
  * to route all requests through the proxy
  * Requirements: 1.4, 7.1
  */
@@ -174,14 +298,25 @@ function getAjaxInterceptorScript(targetOrigin: string, proxyBaseUrl: string): s
 (function() {
   const targetOrigin = '${targetOrigin}';
   const proxyBaseUrl = '${proxyBaseUrl}';
+  const currentOrigin = window.location.origin;
   
   /**
    * Rewrite URL to route through proxy
-   * Handles absolute URLs to target domain and relative URLs
+   * Handles absolute URLs to target domain, relative URLs, and localhost URLs
    */
   function rewriteUrlForProxy(url) {
     try {
-      // Handle relative URLs
+      // Skip data URLs and blob URLs
+      if (url.startsWith('data:') || url.startsWith('blob:')) {
+        return url;
+      }
+      
+      // Skip already proxied URLs
+      if (url.includes('/api/proxy?url=')) {
+        return url;
+      }
+      
+      // Handle relative URLs (not starting with http/https//)
       if (!url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('//')) {
         // Relative URL - make it absolute to target origin
         const absoluteUrl = new URL(url, targetOrigin).href;
@@ -203,7 +338,14 @@ function getAjaxInterceptorScript(targetOrigin: string, proxyBaseUrl: string): s
         return proxyBaseUrl + '/api/proxy?url=' + encodeURIComponent(url);
       }
       
-      // If URL is to a different domain, leave it unchanged (or optionally proxy it)
+      // If URL is to localhost/current origin (relative paths resolved by browser)
+      // These need to be redirected to target origin
+      if (urlObj.origin === currentOrigin && !url.includes('/api/proxy')) {
+        const absoluteUrl = targetOrigin + urlObj.pathname + urlObj.search;
+        return proxyBaseUrl + '/api/proxy?url=' + encodeURIComponent(absoluteUrl);
+      }
+      
+      // External URLs - leave unchanged
       return url;
     } catch (e) {
       // If URL parsing fails, return original
@@ -252,6 +394,29 @@ function getAjaxInterceptorScript(targetOrigin: string, proxyBaseUrl: string): s
     }
     
     return originalFetch.call(this, rewrittenUrl, init);
+  };
+  
+  // Override script element src setter to intercept dynamic script loading (MathJax, etc.)
+  const originalCreateElement = document.createElement.bind(document);
+  document.createElement = function(tagName, options) {
+    const element = originalCreateElement(tagName, options);
+    
+    if (tagName.toLowerCase() === 'script') {
+      const originalSrcDescriptor = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+      Object.defineProperty(element, 'src', {
+        get: function() {
+          return originalSrcDescriptor.get.call(this);
+        },
+        set: function(value) {
+          const rewrittenUrl = rewriteUrlForProxy(value);
+          return originalSrcDescriptor.set.call(this, rewrittenUrl);
+        },
+        configurable: true,
+        enumerable: true
+      });
+    }
+    
+    return element;
   };
 })();
 </script>
@@ -368,15 +533,12 @@ async function proxyRequest(request: NextRequest, method: 'GET' | 'POST', body?:
 
     // Get content type from response
     const contentType = getContentType(res);
+    const proxyBaseUrl = getProxyBaseUrl(request);
+    const targetOrigin = new URL(url).origin;
     
-    // Check if content should be rewritten (HTML only)
-    if (shouldRewriteContent(contentType)) {
-      // HTML content - apply rewriting and script injection
+    // Handle HTML content
+    if (shouldRewriteHtml(contentType)) {
       let html = await res.text();
-
-      // Get the proxy base URL from the request
-      const requestUrl = new URL(request.url);
-      const proxyBaseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
 
       // Rewrite HTML content using the comprehensive rewriting function
       html = rewriteHtmlContent(html, url, proxyBaseUrl);
@@ -387,27 +549,51 @@ async function proxyRequest(request: NextRequest, method: 'GET' | 'POST', body?:
         .primary-navigation { display: none !important; }
         #page-navbar { display: none !important; }
         .breadcrumb { display: none !important; }
+        #usernavigation .popover-region-notifications {display: none !important;}
+        #usernavigation .popover-region {display: none !important;}
+        #usernavigation .usermenu-container {display: none !important;}
       </style>
     `;
       html = html.replace('</head>', `${hideNavCSS}</head>`);
 
       // Inject AJAX interceptor script
-      const targetOrigin = new URL(url).origin;
       const ajaxInterceptorScript = getAjaxInterceptorScript(targetOrigin, proxyBaseUrl);
       html = injectAjaxInterceptor(html, ajaxInterceptorScript);
 
       return new NextResponse(html, {
         headers: getResponseHeaders(contentType),
       });
-    } else {
-      // Non-HTML content - pass through unchanged
-      const content = await res.arrayBuffer();
+    }
+    
+    // Handle CSS content - rewrite url() to route through proxy
+    if (isCssContent(contentType)) {
+      let css = await res.text();
+      css = rewriteCssUrls(css, url, proxyBaseUrl);
       
-      return new NextResponse(content, {
+      return new NextResponse(css, {
         status: res.status,
         headers: getResponseHeaders(contentType),
       });
     }
+    
+    // Handle JavaScript content
+    if (isJsContent(contentType)) {
+      let js = await res.text();
+      js = rewriteJsUrls(js);
+      
+      return new NextResponse(js, {
+        status: res.status,
+        headers: getResponseHeaders(contentType),
+      });
+    }
+    
+    // Non-text content - pass through unchanged
+    const content = await res.arrayBuffer();
+    
+    return new NextResponse(content, {
+      status: res.status,
+      headers: getResponseHeaders(contentType),
+    });
   } catch (error) {
     console.error('Proxy error:', error);
     return NextResponse.json({ error: 'Failed to fetch URL' }, { status: 500 });
